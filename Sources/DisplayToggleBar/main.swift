@@ -117,66 +117,89 @@ final class DisplayManager {
     }
 
     func setDisplay(_ display: Display, enabled: Bool) throws {
-        if !enabled, !canDisable(display) {
-            throw ToggleError.lastActiveDisplay
-        }
+    if !enabled, !canDisable(display) {
+        throw ToggleError.lastActiveDisplay
+    }
 
-        let targetDisplay = enabled ? resolveDisplayForEnable(display) : display
-        let appliedDisplay: Display
+    let targetDisplay = enabled ? resolveDisplayForEnable(display) : display
+    let appliedDisplay: Display
 
+    if !enabled {
+        // Disabling is straightforward
         do {
-            try applyDisplayState(targetDisplay, enabled: enabled, option: .forSession)
+            try applyDisplayState(targetDisplay, enabled: false, option: .forSession)
             appliedDisplay = targetDisplay
-        } catch ToggleError.complete where enabled && targetDisplay.isBuiltin {
-            Thread.sleep(forTimeInterval: 0.35)
-            let refreshedDisplay = resolveDisplayForEnable(targetDisplay)
-
-            do {
-                try applyDisplayState(refreshedDisplay, enabled: enabled, option: .permanently)
-                appliedDisplay = refreshedDisplay
-            } catch ToggleError.complete(let error) {
-                detectDisplays()
-                Thread.sleep(forTimeInterval: 0.35)
-                let detectedDisplay = resolveDisplayForEnable(refreshedDisplay)
-
-                do {
-                    try applyDisplayState(detectedDisplay, enabled: enabled, option: .forSession)
-                    appliedDisplay = detectedDisplay
-                } catch ToggleError.complete {
-                    try wakeDisplayPipeline()
-                    detectDisplays()
-                    Thread.sleep(forTimeInterval: 0.65)
-                    let wakeRefreshedDisplay = resolveDisplayForEnable(detectedDisplay)
-
-                    do {
-                        try applyDisplayState(wakeRefreshedDisplay, enabled: enabled, option: .forSession)
-                        appliedDisplay = wakeRefreshedDisplay
-                    } catch ToggleError.complete {
-                        Thread.sleep(forTimeInterval: 1.0)
-                        detectDisplays()
-                        do {
-                            try applyDisplayState(wakeRefreshedDisplay, enabled: enabled, option: .permanently)
-                            appliedDisplay = wakeRefreshedDisplay
-                        } catch ToggleError.complete {
-                            throw ToggleError.builtinEnableFailed(error)
-                        }
-                    }
-                }
-            }
         } catch {
             throw error
         }
-
-        knownDisplaysByKey[appliedDisplay.cacheKey] = Display(
-            id: appliedDisplay.id,
-            cacheKey: appliedDisplay.cacheKey,
-            uuid: appliedDisplay.uuid,
-            name: appliedDisplay.name,
-            isBuiltin: appliedDisplay.isBuiltin,
-            isActive: enabled
-        )
-        persistKnownDisplays()
+    } else if !targetDisplay.isBuiltin {
+        // Enabling external displays is straightforward
+        do {
+            try applyDisplayState(targetDisplay, enabled: true, option: .forSession)
+            appliedDisplay = targetDisplay
+        } catch {
+            throw error
+        }
+    } else {
+        // Enabling built-in display on Apple Silicon needs retries
+        var lastError: Error?
+        var successDisplay: Display?
+        
+        // Try with session option multiple times
+        let retryDelays: [TimeInterval] = [0.3, 0.5, 1.0, 2.0]
+        
+        for delay in retryDelays {
+            detectDisplays()
+            Thread.sleep(forTimeInterval: delay)
+            
+            let refreshedDisplay = resolveDisplayForEnable(targetDisplay)
+            
+            do {
+                try applyDisplayState(refreshedDisplay, enabled: true, option: .forSession)
+                successDisplay = refreshedDisplay
+                break
+            } catch {
+                lastError = error
+                continue
+            }
+        }
+        
+        // If session retries failed, try permanent option
+        if successDisplay == nil {
+            detectDisplays()
+            Thread.sleep(forTimeInterval: 0.5)
+            let finalDisplay = resolveDisplayForEnable(targetDisplay)
+            
+            do {
+                try applyDisplayState(finalDisplay, enabled: true, option: .permanently)
+                successDisplay = finalDisplay
+            } catch {
+                lastError = error
+            }
+        }
+        
+        // If everything failed, throw the last error
+        guard let display = successDisplay else {
+            if let error = lastError as? ToggleError {
+                throw error
+            } else {
+                throw ToggleError.builtinEnableFailed(.failure)
+            }
+        }
+        
+        appliedDisplay = display
     }
+
+    knownDisplaysByKey[appliedDisplay.cacheKey] = Display(
+        id: appliedDisplay.id,
+        cacheKey: appliedDisplay.cacheKey,
+        uuid: appliedDisplay.uuid,
+        name: appliedDisplay.name,
+        isBuiltin: appliedDisplay.isBuiltin,
+        isActive: enabled
+    )
+    persistKnownDisplays()
+}
 
     @discardableResult
     func restoreBuiltinDisplayIfNeeded(force: Bool = false) throws -> Bool {
