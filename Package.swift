@@ -17,7 +17,11 @@ let package = Package(
                 .linkedFramework("AppKit"),
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("IOKit"),
-                .unsafeFlags(["-F/System/Library/PrivateFrameworks", "-framework", "SkyLight"])
+                .unsafeFlags([
+                    "-F/System/Library/PrivateFrameworks",
+                    "-framework", "SkyLight",
+                    "-framework", "DisplayServices"
+                ])
             ]
         )
     ]
