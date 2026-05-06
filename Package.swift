@@ -20,7 +20,10 @@ let package = Package(
                 .unsafeFlags([
                     "-F/System/Library/PrivateFrameworks",
                     "-framework", "SkyLight",
-                    "-framework", "DisplayServices"
+                    "-framework", "DisplayServices",
+                    "-framework", "MonitorPanel",
+                    "-framework", "CoreDisplay",
+                    "-Xlinker", "-undefined", "-Xlinker", "dynamic_lookup"
                 ])
             ]
         )

@@ -24,6 +24,294 @@ private func DisplayServicesSetBrightness(_ display: CGDirectDisplayID, _ bright
 @_silgen_name("DisplayServicesCanChangeBrightness")
 private func DisplayServicesCanChangeBrightness(_ display: CGDirectDisplayID) -> Bool
 
+// MARK: - IOAVService (dynamic load)
+//
+// IOAVServiceCreateWithService/ReadI2C/WriteI2C are the symbols BetterDisplay
+// and MonitorControl use to talk DDC/CI to external monitors over the I²C
+// pins of their cable. Apple stripped these from the on-disk framework
+// binaries on modern macOS, so we resolve them at runtime via dlsym instead
+// of link-time symbol binding.
+
+private struct IOAVAPI {
+    typealias CreateFn = @convention(c) (CFAllocator?, io_service_t) -> Unmanaged<AnyObject>?
+    typealias ReadFn = @convention(c) (AnyObject, UInt32, UInt32, UnsafeMutableRawPointer, UInt32) -> Int32
+    typealias WriteFn = @convention(c) (AnyObject, UInt32, UInt32, UnsafeRawPointer, UInt32) -> Int32
+    typealias CopyEDIDFn = @convention(c) (AnyObject, UnsafeMutablePointer<Unmanaged<CFData>?>) -> Int32
+
+    let create: CreateFn
+    let read: ReadFn
+    let write: WriteFn
+    let copyEDID: CopyEDIDFn?
+
+    static let shared: IOAVAPI? = load()
+
+    private static func load() -> IOAVAPI? {
+        // RTLD_DEFAULT searches every framework already loaded into the
+        // process. CoreDisplay (which we link below) pulls these in.
+        let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2)
+        let candidatePaths = [
+            "/System/Library/Frameworks/CoreDisplay.framework/CoreDisplay",
+            "/System/Library/PrivateFrameworks/MonitorPanel.framework/MonitorPanel",
+            "/System/Library/PrivateFrameworks/IOAVFamily.framework/IOAVFamily",
+            "/System/Library/PrivateFrameworks/CoreBrightness.framework/CoreBrightness"
+        ]
+
+        func resolve(_ name: String) -> UnsafeMutableRawPointer? {
+            if let p = dlsym(rtldDefault, name) { return p }
+            for path in candidatePaths {
+                guard let h = dlopen(path, RTLD_LAZY) else { continue }
+                if let p = dlsym(h, name) { return p }
+            }
+            return nil
+        }
+
+        guard
+            let createPtr = resolve("IOAVServiceCreateWithService"),
+            let readPtr = resolve("IOAVServiceReadI2C"),
+            let writePtr = resolve("IOAVServiceWriteI2C")
+        else {
+            return nil
+        }
+        let copyEDIDPtr = resolve("IOAVServiceCopyEDID")
+
+        return IOAVAPI(
+            create: unsafeBitCast(createPtr, to: CreateFn.self),
+            read: unsafeBitCast(readPtr, to: ReadFn.self),
+            write: unsafeBitCast(writePtr, to: WriteFn.self),
+            copyEDID: copyEDIDPtr.map { unsafeBitCast($0, to: CopyEDIDFn.self) }
+        )
+    }
+}
+
+// MARK: - DDC over I²C (external monitor brightness)
+
+/// Cached state for one external display's DDC channel.
+private final class DDCCache {
+    let avService: AnyObject
+    var maxValue: UInt16
+    var lastSetValue: UInt16?
+
+    init(avService: AnyObject, maxValue: UInt16, lastSetValue: UInt16?) {
+        self.avService = avService
+        self.maxValue = maxValue
+        self.lastSetValue = lastSetValue
+    }
+}
+
+@MainActor
+final class DDCBrightness {
+    private static let chipAddress: UInt32 = 0x37
+    private static let sourceOffset: UInt32 = 0x51
+    private static let brightnessVCP: UInt8 = 0x10
+
+    private var cache: [CGDirectDisplayID: DDCCache] = [:]
+    // Displays we've already probed and found don't speak DDC — avoid
+    // re-probing on every slider open (would slow the UI for no reason).
+    private var unsupported: Set<CGDirectDisplayID> = []
+
+    func canChangeBrightness(_ displayID: CGDirectDisplayID) -> Bool {
+        guard IOAVAPI.shared != nil else { return false }
+        return ensureCache(for: displayID) != nil
+    }
+
+    func brightness(for displayID: CGDirectDisplayID) -> Float? {
+        guard let entry = ensureCache(for: displayID) else { return nil }
+        if let last = entry.lastSetValue {
+            return Float(last) / Float(entry.maxValue)
+        }
+        if let read = readVCP(Self.brightnessVCP, on: entry.avService) {
+            entry.maxValue = read.max
+            entry.lastSetValue = read.current
+            return Float(read.current) / Float(read.max)
+        }
+        return nil
+    }
+
+    @discardableResult
+    func setBrightness(for displayID: CGDirectDisplayID, normalized value: Float) -> Bool {
+        guard let entry = ensureCache(for: displayID) else { return false }
+        let clamped = max(0, min(1, value))
+        let target = UInt16((Float(entry.maxValue) * clamped).rounded())
+        guard writeVCP(Self.brightnessVCP, value: target, on: entry.avService) else { return false }
+        entry.lastSetValue = target
+        return true
+    }
+
+    func invalidate() {
+        cache.removeAll()
+        unsupported.removeAll()
+    }
+
+    // MARK: - Service matching
+
+    private func ensureCache(for displayID: CGDirectDisplayID) -> DDCCache? {
+        if let existing = cache[displayID] { return existing }
+        if unsupported.contains(displayID) { return nil }
+        guard CGDisplayIsBuiltin(displayID) == 0 else { return nil }
+
+        guard let service = findIOAVService(for: displayID) else {
+            unsupported.insert(displayID)
+            return nil
+        }
+
+        // Probe by reading current brightness. If the monitor doesn't reply
+        // with a valid VCP packet after retries, it doesn't speak DDC over
+        // this connection; mark it unsupported so we don't try again.
+        guard let read = readVCP(Self.brightnessVCP, on: service) else {
+            unsupported.insert(displayID)
+            return nil
+        }
+
+        let entry = DDCCache(avService: service, maxValue: read.max, lastSetValue: read.current)
+        cache[displayID] = entry
+        return entry
+    }
+
+    private func findIOAVService(for displayID: CGDirectDisplayID) -> AnyObject? {
+        guard let api = IOAVAPI.shared else { return nil }
+        guard CGDisplayIsBuiltin(displayID) == 0 else { return nil }
+        guard let copyEDID = api.copyEDID else { return nil }
+
+        let targetVendor = CGDisplayVendorNumber(displayID)
+        let targetModel = CGDisplayModelNumber(displayID)
+        let targetSerial = CGDisplaySerialNumber(displayID)
+
+        let root = IORegistryGetRootEntry(kIOMainPortDefault)
+        var iter: io_iterator_t = 0
+        guard IORegistryEntryCreateIterator(
+            root,
+            kIOServicePlane,
+            IOOptionBits(kIORegistryIterateRecursively),
+            &iter
+        ) == KERN_SUCCESS else { return nil }
+        defer { IOObjectRelease(iter) }
+
+        // Walk every IOService and probe candidates with
+        // IOAVServiceCreateWithService + IOAVServiceCopyEDID. Whichever entry
+        // returns an EDID identifying the target display is the right one.
+        var exactMatch: AnyObject?
+        var vendorProductMatch: AnyObject?
+
+        var entry = IOIteratorNext(iter)
+        while entry != IO_OBJECT_NULL {
+            defer {
+                IOObjectRelease(entry)
+                entry = IOIteratorNext(iter)
+            }
+
+            if let loc = IORegistryEntryCreateCFProperty(entry, "Location" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? String,
+               loc.contains("Embedded") {
+                continue
+            }
+
+            guard let unmanaged = api.create(kCFAllocatorDefault, entry) else { continue }
+            let avService = unmanaged.takeRetainedValue()
+
+            var edidPtr: Unmanaged<CFData>?
+            let edidResult = copyEDID(avService, &edidPtr)
+            guard edidResult == 0, let unmanagedEDID = edidPtr else { continue }
+            let edidData = unmanagedEDID.takeRetainedValue() as Data
+            guard edidData.count >= 18 else { continue }
+
+            let vendor = (UInt32(edidData[8]) << 8) | UInt32(edidData[9])
+            let product = UInt32(edidData[10]) | (UInt32(edidData[11]) << 8)
+            let serial = UInt32(edidData[12])
+                | (UInt32(edidData[13]) << 8)
+                | (UInt32(edidData[14]) << 16)
+                | (UInt32(edidData[15]) << 24)
+
+            if vendor == targetVendor && product == targetModel {
+                if targetSerial == 0 || serial == targetSerial {
+                    if exactMatch == nil { exactMatch = avService }
+                } else if vendorProductMatch == nil {
+                    vendorProductMatch = avService
+                }
+            }
+        }
+
+        return exactMatch ?? vendorProductMatch
+    }
+
+    // MARK: - VCP transport
+
+    private func writeVCP(_ vcp: UInt8, value: UInt16, on service: AnyObject) -> Bool {
+        guard let api = IOAVAPI.shared else { return false }
+        let hi = UInt8((value >> 8) & 0xFF)
+        let lo = UInt8(value & 0xFF)
+        var packet: [UInt8] = [0x84, 0x03, vcp, hi, lo]
+        var checksum: UInt8 = 0x6E ^ UInt8(Self.sourceOffset)
+        for b in packet { checksum ^= b }
+        packet.append(checksum)
+
+        // Apple Silicon's DDC pipe drops packets often; retry up to 3× with
+        // 50ms gaps (same approach MonitorControl/BetterDisplay use).
+        for _ in 0..<3 {
+            let result = packet.withUnsafeBufferPointer { buf -> Int32 in
+                api.write(service, Self.chipAddress, Self.sourceOffset, buf.baseAddress!, UInt32(buf.count))
+            }
+            if result == 0 { return true }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return false
+    }
+
+    private func readVCP(_ vcp: UInt8, on service: AnyObject) -> (current: UInt16, max: UInt16)? {
+        guard let api = IOAVAPI.shared else { return nil }
+        var request: [UInt8] = [0x82, 0x01, vcp]
+        var checksum: UInt8 = 0x6E ^ UInt8(Self.sourceOffset)
+        for b in request { checksum ^= b }
+        request.append(checksum)
+
+        for _ in 0..<3 {
+            let writeResult = request.withUnsafeBufferPointer { buf -> Int32 in
+                api.write(service, Self.chipAddress, Self.sourceOffset, buf.baseAddress!, UInt32(buf.count))
+            }
+            if writeResult != 0 {
+                Thread.sleep(forTimeInterval: 0.05)
+                continue
+            }
+
+            // Monitors need a moment to prepare the reply.
+            Thread.sleep(forTimeInterval: 0.04)
+
+            var response = [UInt8](repeating: 0, count: 12)
+            let readResult = response.withUnsafeMutableBufferPointer { buf -> Int32 in
+                api.read(service, Self.chipAddress, 0, buf.baseAddress!, UInt32(buf.count))
+            }
+            if readResult != 0 {
+                Thread.sleep(forTimeInterval: 0.05)
+                continue
+            }
+
+            // Some chips include the leading 0x6E (slave address echo), others don't.
+            var data = response
+            if data.first == 0x6E { data.removeFirst() }
+            guard data.count >= 10 else {
+                Thread.sleep(forTimeInterval: 0.05)
+                continue
+            }
+            guard data[0] & 0x80 != 0 else {
+                Thread.sleep(forTimeInterval: 0.05)
+                continue
+            }
+            guard data[1] == 0x02 else {
+                Thread.sleep(forTimeInterval: 0.05)
+                continue
+            }
+            // VCP unsupported by monitor — no point retrying.
+            guard data[2] == 0x00 else { return nil }
+            let max = (UInt16(data[5]) << 8) | UInt16(data[6])
+            let current = (UInt16(data[7]) << 8) | UInt16(data[8])
+            guard max > 0 else {
+                Thread.sleep(forTimeInterval: 0.05)
+                continue
+            }
+            return (current, max)
+        }
+        return nil
+    }
+}
+
 struct Display: Identifiable, Equatable, Codable {
     static let builtinCacheKey = "builtin-display"
 
@@ -47,12 +335,18 @@ struct Display: Identifiable, Equatable, Codable {
     }
 }
 
+@MainActor
 final class DisplayManager {
     private let knownDisplaysKey = "knownDisplays"
     private var knownDisplaysByKey: [String: Display] = [:]
+    private let ddc = DDCBrightness()
 
     init() {
         loadKnownDisplays()
+    }
+
+    func invalidateBrightnessCache() {
+        ddc.invalidate()
     }
 
     enum ToggleError: LocalizedError {
@@ -173,20 +467,29 @@ final class DisplayManager {
     }
 
     func canChangeBrightness(_ display: Display) -> Bool {
-        DisplayServicesCanChangeBrightness(display.id)
+        if display.isBuiltin {
+            return DisplayServicesCanChangeBrightness(display.id)
+        }
+        return ddc.canChangeBrightness(display.id)
     }
 
     func brightness(for display: Display) -> Float? {
-        var value: Float = 0
-        let result = DisplayServicesGetBrightness(display.id, &value)
-        guard result == 0 else { return nil }
-        return value
+        if display.isBuiltin {
+            var value: Float = 0
+            let result = DisplayServicesGetBrightness(display.id, &value)
+            guard result == 0 else { return nil }
+            return value
+        }
+        return ddc.brightness(for: display.id)
     }
 
     @discardableResult
     func setBrightness(_ display: Display, to value: Float) -> Bool {
         let clamped = max(0.0, min(1.0, value))
-        return DisplayServicesSetBrightness(display.id, clamped) == 0
+        if display.isBuiltin {
+            return DisplayServicesSetBrightness(display.id, clamped) == 0
+        }
+        return ddc.setBrightness(for: display.id, normalized: clamped)
     }
 
     private func updateKnownDisplay(_ display: Display, isActive: Bool) {
@@ -374,6 +677,7 @@ final class DisplayTileView: NSView {
     private let expandedContainer = NSStackView()
 
     private let canToggle: Bool
+    private let isExpandable: Bool
     private(set) var isExpanded: Bool
 
     private static let collapsedHeight: CGFloat = 36
@@ -381,11 +685,12 @@ final class DisplayTileView: NSView {
 
     private var heightConstraint: NSLayoutConstraint!
 
-    init(display: Display, activeCount: Int, expanded: Bool, delegate: DisplayTileDelegate) {
+    init(display: Display, activeCount: Int, expanded: Bool, canChangeBrightness: Bool, delegate: DisplayTileDelegate) {
         self.display = display
         self.delegate = delegate
         self.canToggle = !display.isActive || activeCount > 1
-        self.isExpanded = expanded
+        self.isExpandable = canChangeBrightness
+        self.isExpanded = canChangeBrightness && expanded
         super.init(frame: NSRect(x: 0, y: 0, width: 320, height: Self.collapsedHeight))
 
         wantsLayer = true
@@ -393,14 +698,19 @@ final class DisplayTileView: NSView {
         layer?.masksToBounds = true
         translatesAutoresizingMaskIntoConstraints = false
 
-        heightConstraint = heightAnchor.constraint(equalToConstant: expanded ? Self.expandedHeight : Self.collapsedHeight)
+        let initialHeight = isExpandable && self.isExpanded ? Self.expandedHeight : Self.collapsedHeight
+        heightConstraint = heightAnchor.constraint(equalToConstant: initialHeight)
         heightConstraint.isActive = true
 
         configureHeader()
-        configureExpanded()
+        if isExpandable {
+            configureExpanded()
+        }
         layoutSubviewsManually()
         applyExpandedState(animated: false)
-        refreshBrightnessFromSystem()
+        if isExpandable {
+            refreshBrightnessFromSystem()
+        }
     }
 
     required init?(coder: NSCoder) { nil }
@@ -478,18 +788,14 @@ final class DisplayTileView: NSView {
         headerRow.translatesAutoresizingMaskIntoConstraints = false
         iconView.translatesAutoresizingMaskIntoConstraints = false
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
-        chevronView.translatesAutoresizingMaskIntoConstraints = false
         switchControl.translatesAutoresizingMaskIntoConstraints = false
-        expandedContainer.translatesAutoresizingMaskIntoConstraints = false
 
         headerRow.addSubview(iconView)
         headerRow.addSubview(titleLabel)
-        headerRow.addSubview(chevronView)
         headerRow.addSubview(switchControl)
         addSubview(headerRow)
-        addSubview(expandedContainer)
 
-        NSLayoutConstraint.activate([
+        var constraints: [NSLayoutConstraint] = [
             headerRow.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
             headerRow.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
             headerRow.topAnchor.constraint(equalTo: topAnchor, constant: 6),
@@ -503,19 +809,34 @@ final class DisplayTileView: NSView {
             titleLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
             titleLabel.centerYAnchor.constraint(equalTo: headerRow.centerYAnchor),
 
-            chevronView.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 6),
-            chevronView.centerYAnchor.constraint(equalTo: headerRow.centerYAnchor),
-
             switchControl.trailingAnchor.constraint(equalTo: headerRow.trailingAnchor),
             switchControl.centerYAnchor.constraint(equalTo: headerRow.centerYAnchor),
+        ]
 
-            chevronView.trailingAnchor.constraint(lessThanOrEqualTo: switchControl.leadingAnchor, constant: -8),
+        if isExpandable {
+            chevronView.translatesAutoresizingMaskIntoConstraints = false
+            expandedContainer.translatesAutoresizingMaskIntoConstraints = false
+            headerRow.addSubview(chevronView)
+            addSubview(expandedContainer)
 
-            expandedContainer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 40),
-            expandedContainer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            expandedContainer.topAnchor.constraint(equalTo: headerRow.bottomAnchor, constant: 6),
-            expandedContainer.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -8)
-        ])
+            constraints.append(contentsOf: [
+                chevronView.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 6),
+                chevronView.centerYAnchor.constraint(equalTo: headerRow.centerYAnchor),
+                chevronView.trailingAnchor.constraint(lessThanOrEqualTo: switchControl.leadingAnchor, constant: -8),
+
+                expandedContainer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 40),
+                expandedContainer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+                expandedContainer.topAnchor.constraint(equalTo: headerRow.bottomAnchor, constant: 6),
+                expandedContainer.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -8)
+            ])
+        } else {
+            // No chevron — let titleLabel run up to the switch.
+            constraints.append(
+                titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: switchControl.leadingAnchor, constant: -8)
+            )
+        }
+
+        NSLayoutConstraint.activate(constraints)
 
         switchControl.setContentHuggingPriority(.required, for: .horizontal)
         switchControl.setContentCompressionResistancePriority(.required, for: .horizontal)
@@ -525,18 +846,22 @@ final class DisplayTileView: NSView {
     // MARK: - Behavior
 
     override func mouseDown(with event: NSEvent) {
+        // No expandable content → let the click pass through (still allows
+        // the switch to receive its own events).
+        guard isExpandable else {
+            super.mouseDown(with: event)
+            return
+        }
+
         let p = convert(event.locationInWindow, from: nil)
-        // Let the switch swallow its own clicks.
         if switchControl.frame.contains(p) {
             super.mouseDown(with: event)
             return
         }
-        // Inside expanded area? Pass through to whatever child handles it.
         if isExpanded, expandedContainer.frame.contains(p) {
             super.mouseDown(with: event)
             return
         }
-        // Header tap → toggle expanded.
         isExpanded.toggle()
         applyExpandedState(animated: true)
         delegate?.displayTile(self, didSetExpanded: isExpanded)
@@ -546,6 +871,11 @@ final class DisplayTileView: NSView {
     }
 
     private func applyExpandedState(animated: Bool) {
+        guard isExpandable else {
+            heightConstraint.constant = Self.collapsedHeight
+            return
+        }
+
         let isExpanding = isExpanded
         chevronView.image = NSImage(
             systemSymbolName: isExpanding ? "chevron.up" : "chevron.down",
@@ -586,7 +916,8 @@ final class DisplayTileView: NSView {
     }
 
     override var intrinsicContentSize: NSSize {
-        NSSize(width: 320, height: isExpanded ? Self.expandedHeight : Self.collapsedHeight)
+        let h = (isExpandable && isExpanded) ? Self.expandedHeight : Self.collapsedHeight
+        return NSSize(width: 320, height: h)
     }
 
     private func refreshBrightnessFromSystem() {
@@ -753,6 +1084,12 @@ final class MenuController: NSObject, DisplayTileDelegate, NSPopoverDelegate {
     private var expandedDisplayKeys: Set<String> = []
     private var eventMonitor: Any?
 
+    // Throttle DDC writes — each round trip is ~50ms over I²C, so spamming on
+    // every continuous slider step makes drags feel laggy. We coalesce to the
+    // most recent value and send at most every 80ms.
+    private var ddcWriteTimer: DispatchSourceTimer?
+    private var pendingDDCWrite: (display: Display, value: Float)?
+
     override init() {
         self.contentVC = PopoverContentViewController()
         super.init()
@@ -815,6 +1152,7 @@ final class MenuController: NSObject, DisplayTileDelegate, NSPopoverDelegate {
                 display: display,
                 activeCount: activeCount,
                 expanded: expandedDisplayKeys.contains(display.cacheKey),
+                canChangeBrightness: displayManager.canChangeBrightness(display),
                 delegate: self
             )
         }
@@ -823,6 +1161,8 @@ final class MenuController: NSObject, DisplayTileDelegate, NSPopoverDelegate {
 
     @objc private func displayConfigurationChanged() {
         let previousDisplayKeys = lastDisplayKeys
+        // Display IDs and IOAVService bindings can change after reconfig.
+        displayManager.invalidateBrightnessCache()
 
         scheduleBuiltinRestorePass(after: 0.8, previousDisplayKeys: previousDisplayKeys, showErrors: true)
         scheduleBuiltinRestorePass(after: 2.0, previousDisplayKeys: previousDisplayKeys, showErrors: false)
@@ -870,7 +1210,28 @@ final class MenuController: NSObject, DisplayTileDelegate, NSPopoverDelegate {
     }
 
     func displayTile(_ tile: DisplayTileView, didChangeBrightness value: Float) {
-        displayManager.setBrightness(tile.display, to: value)
+        let display = tile.display
+        if display.isBuiltin {
+            // DisplayServices is fast (memory write); update on every step.
+            displayManager.setBrightness(display, to: value)
+            return
+        }
+        // External display — throttle to avoid lag during slider drag.
+        pendingDDCWrite = (display, value)
+        if ddcWriteTimer == nil {
+            let timer = DispatchSource.makeTimerSource(queue: .main)
+            timer.schedule(deadline: .now() + 0.08, repeating: .never)
+            timer.setEventHandler { [weak self] in
+                guard let self else { return }
+                if let pending = self.pendingDDCWrite {
+                    self.displayManager.setBrightness(pending.display, to: pending.value)
+                }
+                self.pendingDDCWrite = nil
+                self.ddcWriteTimer = nil
+            }
+            ddcWriteTimer = timer
+            timer.resume()
+        }
     }
 
     func displayTile(_ tile: DisplayTileView, didSetExpanded expanded: Bool) {

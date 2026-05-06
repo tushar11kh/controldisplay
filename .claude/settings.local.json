@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//System/Library/PrivateFrameworks/**)",
+      "Read(//System/Library/**)",
+      "Bash(nm -gU /System/Library/Frameworks/CoreDisplay.framework/Versions/A/CoreDisplay)"
+    ]
+  }
+}
