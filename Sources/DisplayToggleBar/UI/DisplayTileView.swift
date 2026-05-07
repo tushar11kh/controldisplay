@@ -10,6 +10,7 @@ final class DisplaySwitch: NSSwitch {
 protocol DisplayTileDelegate: AnyObject {
     func displayTile(_ tile: DisplayTileView, didToggleEnabled enabled: Bool)
     func displayTile(_ tile: DisplayTileView, didChangeBrightness value: Float)
+    func displayTile(_ tile: DisplayTileView, didSelectMode mode: DisplayMode)
     func displayTile(_ tile: DisplayTileView, didSetExpanded expanded: Bool)
     func displayTileBrightness(_ tile: DisplayTileView) -> Float?
     func displayTileCanChangeBrightness(_ tile: DisplayTileView) -> Bool
@@ -35,21 +36,47 @@ final class DisplayTileView: NSView {
     private let brightnessSlider = NSSlider()
     private let expandedContainer = NSStackView()
 
+    private let modeIcon = NSImageView()
+    private let modePopup = NSPopUpButton()
+    private let modes: [DisplayMode]
+    private let currentMode: DisplayMode?
+
     private let canToggle: Bool
+    private let showsBrightness: Bool
+    private let showsModes: Bool
     private let isExpandable: Bool
     private(set) var isExpanded: Bool
 
     private static let collapsedHeight: CGFloat = 36
-    private static let expandedHeight: CGFloat = 100
+    private static let sectionHeight: CGFloat = 50
+
+    private var expandedHeight: CGFloat {
+        let sections = (showsBrightness ? 1 : 0) + (showsModes ? 1 : 0)
+        return Self.collapsedHeight + CGFloat(sections) * Self.sectionHeight + 4
+    }
 
     private var heightConstraint: NSLayoutConstraint!
 
-    init(display: Display, activeCount: Int, expanded: Bool, canChangeBrightness: Bool, delegate: DisplayTileDelegate) {
+    init(
+        display: Display,
+        activeCount: Int,
+        expanded: Bool,
+        canChangeBrightness: Bool,
+        modes: [DisplayMode],
+        currentMode: DisplayMode?,
+        delegate: DisplayTileDelegate
+    ) {
         self.display = display
         self.delegate = delegate
         self.canToggle = !display.isActive || activeCount > 1
-        self.isExpandable = canChangeBrightness
-        self.isExpanded = canChangeBrightness && expanded
+        self.showsBrightness = canChangeBrightness
+        // Show the mode row whenever there's at least one mode reported. With
+        // a single mode the dropdown is disabled (informational only).
+        self.showsModes = !modes.isEmpty
+        self.modes = modes
+        self.currentMode = currentMode
+        self.isExpandable = self.showsBrightness || self.showsModes
+        self.isExpanded = self.isExpandable && expanded
         super.init(frame: NSRect(x: 0, y: 0, width: 320, height: Self.collapsedHeight))
 
         wantsLayer = true
@@ -57,7 +84,7 @@ final class DisplayTileView: NSView {
         layer?.masksToBounds = true
         translatesAutoresizingMaskIntoConstraints = false
 
-        let initialHeight = isExpandable && self.isExpanded ? Self.expandedHeight : Self.collapsedHeight
+        let initialHeight = isExpandable && self.isExpanded ? expandedHeight : Self.collapsedHeight
         heightConstraint = heightAnchor.constraint(equalToConstant: initialHeight)
         heightConstraint.isActive = true
 
@@ -67,7 +94,7 @@ final class DisplayTileView: NSView {
         }
         layoutSubviewsManually()
         applyExpandedState(animated: false)
-        if isExpandable {
+        if showsBrightness {
             refreshBrightnessFromSystem()
         }
     }
@@ -75,7 +102,7 @@ final class DisplayTileView: NSView {
     required init?(coder: NSCoder) { nil }
 
     override var intrinsicContentSize: NSSize {
-        let h = (isExpandable && isExpanded) ? Self.expandedHeight : Self.collapsedHeight
+        let h = (isExpandable && isExpanded) ? expandedHeight : Self.collapsedHeight
         return NSSize(width: 320, height: h)
     }
 
@@ -105,6 +132,28 @@ final class DisplayTileView: NSView {
     }
 
     private func configureExpanded() {
+        expandedContainer.orientation = .vertical
+        expandedContainer.alignment = .leading
+        expandedContainer.spacing = 8
+        expandedContainer.distribution = .fill
+
+        func addStretchingRow(_ row: NSView) {
+            expandedContainer.addArrangedSubview(row)
+            row.leadingAnchor.constraint(equalTo: expandedContainer.leadingAnchor).isActive = true
+            row.trailingAnchor.constraint(equalTo: expandedContainer.trailingAnchor).isActive = true
+        }
+
+        if showsBrightness {
+            expandedContainer.addArrangedSubview(makeSectionLabel("Brightness"))
+            addStretchingRow(buildBrightnessRow())
+        }
+        if showsModes {
+            expandedContainer.addArrangedSubview(makeSectionLabel("Display Mode"))
+            addStretchingRow(buildModeRow())
+        }
+    }
+
+    private func buildBrightnessRow() -> NSView {
         brightnessIcon.image = NSImage(systemSymbolName: "sun.max.fill", accessibilityDescription: nil)
         brightnessIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 12, weight: .regular)
         brightnessIcon.contentTintColor = .secondaryLabelColor
@@ -124,21 +173,64 @@ final class DisplayTileView: NSView {
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 8
-        row.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+        row.translatesAutoresizingMaskIntoConstraints = false
 
         brightnessIcon.setContentHuggingPriority(.required, for: .horizontal)
         brightnessLabel.setContentHuggingPriority(.required, for: .horizontal)
         brightnessLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 36).isActive = true
+        return row
+    }
 
-        expandedContainer.orientation = .vertical
-        expandedContainer.alignment = .leading
-        expandedContainer.spacing = 6
-        expandedContainer.distribution = .fill
-        expandedContainer.addArrangedSubview(makeSectionLabel("Brightness"))
-        expandedContainer.addArrangedSubview(row)
+    private func buildModeRow() -> NSView {
+        modeIcon.image = NSImage(systemSymbolName: "display", accessibilityDescription: nil)
+        modeIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 12, weight: .regular)
+        modeIcon.contentTintColor = .secondaryLabelColor
+
+        modePopup.translatesAutoresizingMaskIntoConstraints = false
+        modePopup.bezelStyle = .rounded
+        modePopup.controlSize = .small
+        modePopup.target = self
+        modePopup.action = #selector(modeChanged(_:))
+        modePopup.isEnabled = modes.count > 1
+
+        let hiDPIModes = modes.filter { $0.isHiDPI }
+        let nativeModes = modes.filter { !$0.isHiDPI }
+        let useHeaders = !hiDPIModes.isEmpty && !nativeModes.isEmpty
+
+        if useHeaders {
+            modePopup.menu?.addItem(makeSectionHeader("HiDPI — sharp UI, less space"))
+        }
+        for mode in hiDPIModes {
+            let title = "\(mode.width)×\(mode.height) @ \(mode.refreshRateRounded) Hz"
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.representedObject = mode.id
+            modePopup.menu?.addItem(item)
+        }
+
+        if useHeaders {
+            modePopup.menu?.addItem(.separator())
+            modePopup.menu?.addItem(makeSectionHeader("Native — more space, panel-native density"))
+        }
+        for mode in nativeModes {
+            let title = "\(mode.pixelWidth)×\(mode.pixelHeight) @ \(mode.refreshRateRounded) Hz"
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.representedObject = mode.id
+            modePopup.menu?.addItem(item)
+        }
+
+        if let current = currentMode,
+           let menuItem = modePopup.menu?.items.first(where: { ($0.representedObject as? Int32) == current.id }) {
+            modePopup.select(menuItem)
+        }
+
+        let row = NSStackView(views: [modeIcon, modePopup])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
         row.translatesAutoresizingMaskIntoConstraints = false
-        row.leadingAnchor.constraint(equalTo: expandedContainer.leadingAnchor).isActive = true
-        row.trailingAnchor.constraint(equalTo: expandedContainer.trailingAnchor).isActive = true
+
+        modeIcon.setContentHuggingPriority(.required, for: .horizontal)
+        return row
     }
 
     private func makeSectionLabel(_ text: String) -> NSTextField {
@@ -146,6 +238,21 @@ final class DisplayTileView: NSView {
         label.font = .systemFont(ofSize: 11, weight: .regular)
         label.textColor = .secondaryLabelColor
         return label
+    }
+
+    /// A non-selectable, styled menu item used as a section header inside
+    /// the mode popup.
+    private func makeSectionHeader(_ text: String) -> NSMenuItem {
+        let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        item.attributedTitle = NSAttributedString(
+            string: text,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 10, weight: .semibold),
+                .foregroundColor: NSColor.tertiaryLabelColor
+            ]
+        )
+        return item
     }
 
     private func layoutSubviewsManually() {
@@ -246,7 +353,7 @@ final class DisplayTileView: NSView {
             accessibilityDescription: nil
         )
 
-        let targetHeight: CGFloat = isExpanding ? Self.expandedHeight : Self.collapsedHeight
+        let targetHeight: CGFloat = isExpanding ? expandedHeight : Self.collapsedHeight
 
         guard animated else {
             heightConstraint.constant = targetHeight
@@ -300,5 +407,11 @@ final class DisplayTileView: NSView {
         let value = sender.floatValue
         brightnessLabel.stringValue = "\(Int((value * 100).rounded()))%"
         delegate?.displayTile(self, didChangeBrightness: value)
+    }
+
+    @objc private func modeChanged(_ sender: NSPopUpButton) {
+        guard let id = sender.selectedItem?.representedObject as? Int32,
+              let mode = modes.first(where: { $0.id == id }) else { return }
+        delegate?.displayTile(self, didSelectMode: mode)
     }
 }

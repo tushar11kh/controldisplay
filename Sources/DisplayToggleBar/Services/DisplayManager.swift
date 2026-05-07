@@ -190,6 +190,89 @@ final class DisplayManager {
         ddc.invalidate()
     }
 
+    // MARK: - Display modes (resolution + refresh rate)
+
+    /// Every `CGDisplayMode` macOS reports for the display. We deliberately
+    /// don't filter on `isUsableForDesktopGUI` — many modes flagged
+    /// "non-recommended" actually work fine, and macOS re-enumerates the
+    /// "usable" set after a mode change, so dropping them up-front would
+    /// hide real options (this is the same behavior BetterDisplay relies
+    /// on). `kCGDisplayShowDuplicateLowResolutionModes` unhides modes
+    /// classified as duplicates.
+    func availableModes(for display: Display) -> [DisplayMode] {
+        let options = [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary
+        guard let cgModes = CGDisplayCopyAllDisplayModes(display.id, options) as? [CGDisplayMode] else {
+            return []
+        }
+        return cgModes.map(DisplayMode.init)
+    }
+
+    func currentMode(for display: Display) -> DisplayMode? {
+        guard let cg = CGDisplayCopyDisplayMode(display.id) else { return nil }
+        return DisplayMode(cg)
+    }
+
+    /// All desktop-usable display modes, deduped and sorted for the
+    /// dropdown. Includes both HiDPI ("Retina"-style) and non-HiDPI
+    /// variants — they have the same pixel resolution but produce different
+    /// UI scaling, and the user choice depends on panel pixel density.
+    ///
+    /// Sort: larger pixel area first; then larger point area (= less
+    /// aggressive scaling); then higher refresh rate. That puts the most
+    /// "powerful" modes at the top.
+    func displayModes(for display: Display) -> [DisplayMode] {
+        let allModes = availableModes(for: display)
+
+        let sorted = allModes.sorted { a, b in
+            let aPixels = a.pixelWidth * a.pixelHeight
+            let bPixels = b.pixelWidth * b.pixelHeight
+            if aPixels != bPixels { return aPixels > bPixels }
+            let aPointArea = a.width * a.height
+            let bPointArea = b.width * b.height
+            if aPointArea != bPointArea { return aPointArea > bPointArea }
+            return a.refreshRate > b.refreshRate
+        }
+
+        // Dedup on (pixelW, pixelH, isHiDPI, roundedRate). HiDPI and
+        // non-HiDPI variants of the same pixel resolution are distinct modes
+        // with different UI scaling and must both be selectable.
+        var seen = Set<String>()
+        var unique: [DisplayMode] = []
+        for mode in sorted {
+            let key = "\(mode.pixelWidth)x\(mode.pixelHeight)x\(mode.isHiDPI)@\(Int(mode.refreshRate.rounded()))"
+            if seen.insert(key).inserted {
+                unique.append(mode)
+            }
+        }
+        return unique
+    }
+
+    @discardableResult
+    func setMode(_ mode: DisplayMode, on display: Display) -> Bool {
+        FileHandle.standardError.write(Data(
+            "[mode] applying id=\(mode.id) px=\(mode.pixelWidth)x\(mode.pixelHeight) pt=\(mode.width)x\(mode.height) hiDPI=\(mode.isHiDPI) @ \(String(format: "%.2f", mode.refreshRate))Hz\n".utf8
+        ))
+        return applyDisplayMode(mode.cgDisplayMode(), on: display)
+    }
+
+    private func applyDisplayMode(_ cgMode: CGDisplayMode, on display: Display) -> Bool {
+        var config: CGDisplayConfigRef?
+        let begin = CGBeginDisplayConfiguration(&config)
+        FileHandle.standardError.write(Data("[mode]   begin=\(begin.rawValue)\n".utf8))
+        guard begin == .success, let config else { return false }
+
+        let configure = CGConfigureDisplayWithDisplayMode(config, display.id, cgMode, nil)
+        FileHandle.standardError.write(Data("[mode]   configure=\(configure.rawValue)\n".utf8))
+        guard configure == .success else {
+            CGCancelDisplayConfiguration(config)
+            return false
+        }
+
+        let complete = CGCompleteDisplayConfiguration(config, .forSession)
+        FileHandle.standardError.write(Data("[mode]   complete=\(complete.rawValue)\n".utf8))
+        return complete == .success
+    }
+
     // MARK: - Configuration transactions
 
     private func applyDisplayState(_ display: Display, enabled: Bool, option: CGConfigureOption) throws {

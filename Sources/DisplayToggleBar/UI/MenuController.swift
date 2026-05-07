@@ -83,11 +83,15 @@ final class MenuController: NSObject, DisplayTileDelegate, NSPopoverDelegate {
         expandedDisplayKeys.formIntersection(Set(displays.map(\.cacheKey)))
 
         let tiles = displays.map { display in
-            DisplayTileView(
+            let modes = displayManager.displayModes(for: display)
+            let currentMode = displayManager.currentMode(for: display)
+            return DisplayTileView(
                 display: display,
                 activeCount: activeCount,
                 expanded: expandedDisplayKeys.contains(display.cacheKey),
                 canChangeBrightness: displayManager.canChangeBrightness(display),
+                modes: modes,
+                currentMode: currentMode,
                 delegate: self
             )
         }
@@ -168,6 +172,16 @@ final class MenuController: NSObject, DisplayTileDelegate, NSPopoverDelegate {
             }
             ddcWriteTimer = timer
             timer.resume()
+        }
+    }
+
+    func displayTile(_ tile: DisplayTileView, didSelectMode mode: DisplayMode) {
+        guard displayManager.setMode(mode, on: tile.display) else { return }
+        // Mode change triggers didChangeScreenParameters, which already
+        // schedules a refresh — but refresh promptly so the popover state
+        // updates without waiting for the system notification.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.refreshContent()
         }
     }
 
